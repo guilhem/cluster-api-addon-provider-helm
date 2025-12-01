@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
 	helmRelease "helm.sh/helm/v3/pkg/release"
 	helmDriver "helm.sh/helm/v3/pkg/storage/driver"
@@ -30,7 +31,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
-	"k8s.io/utils/ptr"
 	addonsv1alpha1 "sigs.k8s.io/cluster-api-addon-provider-helm/api/v1alpha1"
 	"sigs.k8s.io/cluster-api-addon-provider-helm/internal"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -44,7 +44,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
 // HelmReleaseProxyReconciler reconciles a HelmReleaseProxy object.
@@ -77,7 +79,7 @@ func (r *HelmReleaseProxyReconciler) SetupWithManager(ctx context.Context, mgr c
 				predicates.All(mgr.GetScheme(), ctrl.LoggerFrom(ctx),
 					predicates.Any(mgr.GetScheme(), ctrl.LoggerFrom(ctx),
 						predicates.ClusterUnpaused(mgr.GetScheme(), ctrl.LoggerFrom(ctx)),
-						predicates.ClusterControlPlaneInitialized(mgr.GetScheme(), ctrl.LoggerFrom(ctx)),
+						clusterControlPlaneAvailable(mgr.GetScheme(), ctrl.LoggerFrom(ctx)),
 					),
 					predicates.ResourceHasFilterLabel(mgr.GetScheme(), ctrl.LoggerFrom(ctx), r.WatchFilterValue),
 				),
@@ -219,17 +221,20 @@ func (r *HelmReleaseProxyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, wrappedErr
 	}
 
-	if ptr.Equal(cluster.Status.Initialization.ControlPlaneInitialized, ptr.To(false)) {
-		log.Info("Waiting for the control plane to be initialized")
+	// Wait for the control plane to be fully available before proceeding.
+	// This ensures we don't overload the API server during cluster creation
+	// by waiting for the control plane provider to finish all its work.
+	// Note: ControlPlaneAvailable implies ControlPlaneInitialized, so we only need this check.
+	if !conditions.IsTrue(cluster, clusterv1.ClusterControlPlaneAvailableCondition) {
+		log.Info("Waiting for the control plane to be fully available")
 		conditions.Set(helmReleaseProxy, metav1.Condition{
 			Type:    addonsv1alpha1.ClusterAvailableCondition,
 			Status:  metav1.ConditionFalse,
 			Reason:  clusterv1.ClusterControlPlaneNotAvailableReason,
-			Message: "",
+			Message: "Waiting for control plane to be fully available",
 		})
 
-		// Return since the kubeconfig won't be available or useable until the API server is reachable.
-		// The controller watches the Cluster for control plane initialization in SetupWithManager, so a requeue is not necessary.
+		// The controller watches the Cluster, so a requeue is not necessary.
 		return ctrl.Result{}, nil
 	}
 
@@ -599,4 +604,54 @@ func writeCACertificateToFile(ctx context.Context, caCertificate []byte) (string
 	}
 
 	return caCertFile.Name(), nil
+}
+
+// clusterControlPlaneAvailable returns a predicate that returns true when a
+// cluster's control plane is available or becomes available.
+// This predicate triggers reconciliation in two cases:
+// 1. When the control plane transitions from not-available to available (UpdateFunc)
+// 2. When the controller starts and the cluster already has control plane available (CreateFunc from cache perspective)
+// Note: The actual availability check is always performed in Reconcile(), this predicate
+// is just an optimization to trigger reconciliation at the right time.
+func clusterControlPlaneAvailable(_ *runtime.Scheme, log logr.Logger) predicate.Funcs {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldCluster, ok := e.ObjectOld.(*clusterv1.Cluster)
+			if !ok {
+				return false
+			}
+			newCluster, ok := e.ObjectNew.(*clusterv1.Cluster)
+			if !ok {
+				return false
+			}
+
+			// Trigger when control plane becomes available (transition from false to true)
+			oldAvailable := conditions.IsTrue(oldCluster, clusterv1.ClusterControlPlaneAvailableCondition)
+			newAvailable := conditions.IsTrue(newCluster, clusterv1.ClusterControlPlaneAvailableCondition)
+
+			if !oldAvailable && newAvailable {
+				log.V(4).Info("Cluster control plane became available", "cluster", newCluster.Name, "namespace", newCluster.Namespace)
+				return true
+			}
+
+			return false
+		},
+		// CreateFunc triggers when the informer cache is populated (e.g., controller restart).
+		// If the cluster already has control plane available, we want to reconcile.
+		CreateFunc: func(e event.CreateEvent) bool {
+			cluster, ok := e.Object.(*clusterv1.Cluster)
+			if !ok {
+				return false
+			}
+
+			if conditions.IsTrue(cluster, clusterv1.ClusterControlPlaneAvailableCondition) {
+				log.V(4).Info("Cluster already has control plane available", "cluster", cluster.Name, "namespace", cluster.Namespace)
+				return true
+			}
+
+			return false
+		},
+		DeleteFunc:  func(_ event.DeleteEvent) bool { return false },
+		GenericFunc: func(_ event.GenericEvent) bool { return false },
+	}
 }
